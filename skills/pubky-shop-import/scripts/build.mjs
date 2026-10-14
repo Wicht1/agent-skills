@@ -139,7 +139,7 @@ function buildDescription(product, override, texts, itemLang) {
   const long = cleanText(htmlToText(texts.longHtml));
   const parts = override?.description
     ? [override.description.trim()]
-    : [short, long && !long.startsWith(short.slice(0, 60)) ? long : ""].filter(Boolean);
+    : [short, long && !(short && long.startsWith(short.slice(0, 60))) ? long : ""].filter(Boolean);
   if (itemLang && language.descriptionLine) parts.unshift(language.descriptionLine.replaceAll("{language}", itemLang));
   if (config.description?.footer && !override?.noFooter) {
     parts.push(config.description.footer.replaceAll("{url}", texts.url ?? product.permalink));
@@ -182,7 +182,7 @@ function optionKey(name) {
   return "style";
 }
 
-async function downloadMedia(product, images, title) {
+async function downloadMedia(product, images, title, warnings) {
   const dir = path.join(workDir, "media");
   mkdirSync(dir, { recursive: true });
   const media = [];
@@ -193,12 +193,19 @@ async function downloadMedia(product, images, title) {
     const file = path.join(dir, `${product.id}-${index + 1}${path.extname(new URL(image.src).pathname) || ".img"}`);
     if (!existsSync(file)) {
       const response = await fetchWithRetry(image.src, { headers: { accept: "image/*" } });
-      if (!response.ok) throw new Error(`image ${image.src} → HTTP ${response.status}`);
+      if (!response.ok) {
+        warnings.push(`photo ${index + 1} skipped (HTTP ${response.status})`);
+        continue;
+      }
       writeFileSync(file, new Uint8Array(await response.arrayBuffer()));
+    }
+    // Only raster formats the Shop renders (PNG/JPEG/WebP/GIF); SVG and others are skipped.
+    if (!sniffImageMime(new Uint8Array(readFileSync(file)))) {
+      warnings.push(`photo ${index + 1} skipped (${path.extname(file) || "unknown"} is not PNG/JPEG/WebP/GIF)`);
+      continue;
     }
     const bytes = shrinkIfNeeded(file, { maxEdge: config.media?.maxEdge ?? 2000, maxBytes: config.media?.maxBytes ?? 3_000_000 });
     const mimeType = sniffImageMime(bytes);
-    if (!mimeType) throw new Error(`not an image: ${image.src}`);
     const { width, height } = imageSize(bytes);
     const contentHash = blake3Hex(bytes);
     const id = contentHash.slice(0, 32);
@@ -246,7 +253,7 @@ for (const product of products) {
         let key = optionKey(name);
         while (options[key] !== undefined) key = `${key}2`;
         keys.add(key);
-        options[key] = String(value).slice(0, 80);
+        options[key] = String(language.valueNames?.[value] ?? value).slice(0, 80);
       }
       const price = toListingMoney(v.price);
       const quantity = quantityOf(v, override.variants?.[v.id]);
@@ -293,7 +300,7 @@ for (const product of products) {
   else if (category.kind === "branch") warnings.push(`category ${categoryId} is a branch, not a leaf`);
 
   const images = [...product.images, ...product.variations.flatMap((v) => v.images)];
-  const media = include || flags["all-media"] ? await downloadMedia(product, images, title) : [];
+  const media = include || flags["all-media"] ? await downloadMedia(product, images, title, warnings) : [];
   if (include && media.length === 0) {
     include = false;
     warnings.push("no usable images — not published");
@@ -327,6 +334,8 @@ for (const product of products) {
     },
     media,
   };
+  const body = entry.draft.description.replace(config.description?.footer?.split("{url}")[0] ?? "\u0000", "").trim();
+  if (body.length < 80) entry.warnings.push("description is (nearly) empty — check the source text or add an override");
   if (include) {
     const errors = validateListing(materialize(entry, DUMMY_OWNER));
     if (errors.length) {

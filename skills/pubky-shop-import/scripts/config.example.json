@@ -33,6 +33,7 @@
     "prefer": "en",
     "listingLanguageName": "English",
     "names": { "Deutsch": "German", "Englisch": "English", "Français": "French", "Italiano": "Italian" },
+    "valueNames": { "Schwarz": "Black", "Weiss": "White", "Gelb": "Yellow", "Grün": "Green" },
     "descriptionLine": "Language: {language}",
     "titleSuffix": " ({language})"
   },

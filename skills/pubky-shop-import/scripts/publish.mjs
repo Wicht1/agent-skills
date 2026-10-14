@@ -28,7 +28,21 @@ const forcedState = flags.state;
 if (forcedState && !["active", "paused", "removed"].includes(forcedState)) die("--state must be active, paused or removed");
 
 await loadCategories(workDir);
-const { session, pubky: owner } = await restoreSession(flags.pubky);
+let { session, pubky: owner } = await restoreSession(flags.pubky);
+
+/**
+ * Homeserver call with one re-authentication: another process restoring the same stored
+ * session gets a fresh token, which can invalidate this one (401 "No authenticated session").
+ */
+async function hs(label, fn) {
+  try {
+    return await withRetry(label, () => fn(session));
+  } catch (error) {
+    if (!/401|No authenticated session/i.test(String(error?.message ?? error))) throw error;
+    ({ session } = await restoreSession(owner));
+    return await withRetry(label, () => fn(session));
+  }
+}
 console.log(`Seller: ${owner}${confirm ? "" : "   (DRY RUN — add --confirm to publish)"}`);
 
 // ---------------------------------------------------------------- preflight
@@ -47,8 +61,8 @@ if (selected.length === 0) die("Nothing to publish (check --ids and plan.json in
 const results = [];
 for (const entry of selected) {
   const recordPath = `${LISTINGS_PREFIX}${entry.listingId}`;
-  const existing = await withRetry("read existing", async () =>
-    (await session.storage.exists(recordPath)) ? await session.storage.getJson(recordPath) : undefined,
+  const existing = await hs("read existing", async (s) =>
+    (await s.storage.exists(recordPath)) ? await s.storage.getJson(recordPath) : undefined,
   );
   const state = forcedState ?? existing?.state ?? "active";
   let record = materialize(entry, owner, { state });
@@ -56,6 +70,7 @@ for (const entry of selected) {
   if (existing) {
     if (contentKey({ ...existing }) === contentKey(record)) {
       results.push({ entry, action: "unchanged", record: existing });
+      if (confirm) recordInLog(entry, existing);
       continue;
     }
     action = "update";
@@ -78,12 +93,12 @@ for (const entry of selected) {
   let uploaded = 0;
   for (const media of entry.media) {
     const mediaPath = `${MEDIA_PREFIX}${media.id}`;
-    if (await withRetry("media exists", () => session.storage.exists(mediaPath))) continue;
+    if (await hs("media exists", (s) => s.storage.exists(mediaPath))) continue;
     const bytes = new Uint8Array(readFileSync(path.join(workDir, media.file)));
-    await withRetry(`upload ${media.file}`, () => session.storage.putBytes(mediaPath, bytes));
+    await hs(`upload ${media.file}`, (s) => s.storage.putBytes(mediaPath, bytes));
     uploaded += 1;
   }
-  await withRetry(`write listing ${entry.listingId}`, () => session.storage.putJson(recordPath, record));
+  await hs(`write listing ${entry.listingId}`, (s) => s.storage.putJson(recordPath, record));
 
   let servedRevision;
   for (let attempt = 0; attempt < 6 && servedRevision !== record.revision; attempt += 1) {
@@ -91,6 +106,11 @@ for (const entry of selected) {
     servedRevision = (await publicGetJson(owner, recordPath).catch(() => undefined))?.revision;
   }
   results.push({ entry, action, record, uploaded, verified: servedRevision === record.revision });
+  recordInLog(entry, record);
+}
+
+/** Saved after every listing, so an interrupted run still leaves an accurate log. */
+function recordInLog(entry, record) {
   log.owner = owner;
   log.listings[entry.listingId] = {
     productId: entry.productId,
@@ -100,8 +120,8 @@ for (const entry of selected) {
     publishedAt: record.updatedAt,
     shopUrl: `${SHOP_ORIGIN}/marketplace/listing/${owner}/${entry.listingId}`,
   };
+  writeJson(logFile, log);
 }
-if (confirm) writeJson(logFile, log);
 
 // ---------------------------------------------------------------- report
 for (const r of results) {
